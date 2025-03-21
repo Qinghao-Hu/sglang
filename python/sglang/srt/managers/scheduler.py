@@ -1622,18 +1622,20 @@ class Scheduler(SchedulerOutputProcessorMixin):
         return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        self.stashed_model_static_state = _export_static_state(
-            self.tp_worker.worker.model_runner.model
-        )
+        if isinstance(self.tp_worker, TpModelWorkerClient):
+            self.stashed_model_static_state = _export_static_state(self.tp_worker.worker.model_runner.model)
+        else:
+            self.stashed_model_static_state = _export_static_state(self.tp_worker.model_runner.model)
         self.memory_saver_adapter.pause()
         self.flush_cache()
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
         self.memory_saver_adapter.resume()
-        _import_static_state(
-            self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
-        )
+        if isinstance(self.tp_worker, TpModelWorkerClient):
+            _import_static_state(self.tp_worker.worker.model_runner.model, self.stashed_model_static_state)
+        else:
+            _import_static_state(self.tp_worker.model_runner.model, self.stashed_model_static_state)
         del self.stashed_model_static_state
         return ResumeMemoryOccupationReqOutput()
 
