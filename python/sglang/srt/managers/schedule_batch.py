@@ -1143,6 +1143,11 @@ class ScheduleBatch:
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return
+        elif self.spec_algorithm.is_lookahead():
+            self.spec_info.prepare_for_verify(self)
+            # overwrite the forward_mode
+            self.forward_mode = ForwardMode.TARGET_VERIFY
+            return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
             if self.enable_overlap:

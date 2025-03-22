@@ -244,6 +244,17 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
+        elif self.spec_algorithm.is_lookahead():
+            from sglang.srt.speculative.lookahead_worker import LOOKAHEADWorker
+
+            self.draft_worker = LOOKAHEADWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                server_args=server_args,
+                dp_rank=dp_rank,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+            )
         else:
             self.draft_worker = None
 
@@ -457,13 +468,10 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
         self.decode_mem_cache_buf_multiplier = (
             1
-            if self.spec_algorithm.is_none()
+            if self.spec_algorithm.is_none() or self.spec_algorithm.is_lookahead()
             else (
                 server_args.speculative_num_draft_tokens
-                + (
-                    server_args.speculative_eagle_topk
-                    * server_args.speculative_num_steps
-                )
+                + (server_args.speculative_eagle_topk * server_args.speculative_num_steps)
             )
         )
 
@@ -1191,6 +1199,9 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
+
+        if self.spec_algorithm.is_lookahead():
+            batch.spec_info = self.draft_worker.prepare_for_verify(batch)
 
         # Update batch tensors
         batch.prepare_for_decode()

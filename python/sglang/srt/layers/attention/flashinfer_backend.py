@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
 from sglang.srt.utils import get_bool_env_var, is_flashinfer_available
 
 if TYPE_CHECKING:
@@ -870,8 +871,10 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
         else:
-            assert isinstance(spec_info, EagleDraftInput) or isinstance(
-                spec_info, EagleVerifyInput
+            assert (
+                isinstance(spec_info, EagleDraftInput)
+                or isinstance(spec_info, EagleVerifyInput)
+                or isinstance(spec_info, LookaheadVerifyInput)
             )
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(

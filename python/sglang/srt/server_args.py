@@ -136,6 +136,8 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    speculative_lookahead_path: Optional[str] = None
+    speculative_lookahead_one_branch: bool = False
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -311,6 +313,16 @@ class ServerArgs:
             # The token generated from the verify step is counted.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
             # assert self.speculative_num_steps < self.speculative_num_draft_tokens
+
+        if self.speculative_algorithm == "LOOKAHEAD":
+            self.disable_overlap_schedule = True
+            self.chunked_prefill_size = -1
+            self.disable_mla = True
+            self.enable_double_sparsity = False
+            assert self.attention_backend == "flashinfer", "Lookahead speculative decoding only support flashinfer for now."
+            logger.info(
+                "The mla, chunked_prefill, overlap scheduler and double_sparsity are disabled because of lookahead speculative decoding."
+            )
 
         # GGUF
         if (
@@ -792,7 +804,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "LOOKAHEAD"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -835,6 +847,17 @@ class ServerArgs:
             type=str,
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
+        )
+        parser.add_argument(
+            "--speculative-lookahead-path",
+            type=str,
+            help="The path of the lookahead. If provided, the lookahead will be inited from this path. You can `lookahead_cache.save_mem('lookahrad.pkl')` to save the lookahead for later use.",
+            required=False,
+        )
+        parser.add_argument(
+            "--speculative-lookahead-one-branch",
+            action="store_true",
+            help="Whether to use one branch in Lookahead Speculative Decoding.",
         )
 
         # Double Sparsity
