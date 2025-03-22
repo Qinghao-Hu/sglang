@@ -1,25 +1,24 @@
 import logging
-import threading
-import time
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
-from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.lookahead_cache import LookaheadCache
 from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import broadcast_pyobj
-
 
 logger = logging.getLogger(__name__)
 
 
 class LOOKAHEADWorker:
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -27,11 +26,14 @@ class LOOKAHEADWorker:
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
-        target_worker: "TpModelWorker",
+        target_worker: TpModelWorker,
     ):
+        self.server_args = server_args
+        self.gpu_id = gpu_id
+        self.tp_rank = tp_rank
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.tp_rank = tp_rank
+        self.speculative_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
         self.num_branch_token: int = server_args.speculative_num_draft_tokens
         self.one_branch = server_args.speculative_lookahead_one_branch
         self.lookahead_cache = None
@@ -41,6 +43,34 @@ class LOOKAHEADWorker:
                 logger.info(f"Load lookahead from: {server_args.speculative_lookahead_path}")
                 self.lookahead_cache.load_mem(server_args.speculative_lookahead_path)
         self.rids = {}
+
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
+
+    def forward_batch_speculative_generation(self, batch: ScheduleBatch) -> Tuple[LogitsProcessorOutput, List[int], int, int]:
+        if batch.forward_mode.is_target_verify():
+            verify_input = batch.spec_info
+            model_worker_batch = batch.get_model_worker_batch()
+            logits_output, _ = self.target_worker.forward_batch_generation(model_worker_batch, skip_sample=True)
+            batch.forward_mode = ForwardMode.DECODE
+            logits_output, verified_id, accept_length_sum = verify_input.verify(
+                batch, logits_output, self.token_to_kv_pool_allocator
+            )
+            return logits_output, verified_id, model_worker_batch, accept_length_sum
+        else:
+            model_worker_batch = batch.get_model_worker_batch()
+            logits_output, next_token_ids = self.target_worker.forward_batch_generation(model_worker_batch)
+            if self.lookahead_cache is not None:
+                next_token_ids_cpu = next_token_ids.tolist()
+                for r, token in zip(batch.reqs, next_token_ids_cpu):
+                    self.rids[r.rid] = len(self.rids)
+                    put_ids = r.fill_ids + [token]
+                    self.lookahead_cache.put(
+                        put_ids[1:],
+                        branch_length=self.num_branch_token * 2,
+                        mode="input",
+                        idx=self.rids[r.rid],
+                    )
+            return logits_output, next_token_ids, model_worker_batch, 0
 
     def prepare_for_verify(self, batch: ScheduleBatch):
         bs = len(batch.reqs)
@@ -147,31 +177,7 @@ class LOOKAHEADWorker:
             self.draft_token_nums,
         )
 
-    def forward_batch_speculative_generation(self, batch: ScheduleBatch):
-        if batch.forward_mode.is_target_verify():
-            verify_input = batch.spec_info
-            model_worker_batch = batch.get_model_worker_batch()
-            logits_output, _ = self.target_worker.forward_batch_generation(model_worker_batch, skip_sample=True)
-            batch.forward_mode = ForwardMode.DECODE
-            logits_output, verified_id, accept_length_sum = verify_input.verify(batch, logits_output)
-            return logits_output, verified_id, model_worker_batch, accept_length_sum
-
-        else:
-            model_worker_batch = batch.get_model_worker_batch()
-            logits_output, next_token_ids = self.target_worker.forward_batch_generation(model_worker_batch)
-            if self.lookahead_cache is not None:
-                next_token_ids_cpu = next_token_ids.tolist()
-                for r, token in zip(batch.reqs, next_token_ids_cpu):
-                    self.rids[r.rid] = len(self.rids)
-                    put_ids = r.fill_ids + [token]
-                    self.lookahead_cache.put(
-                        put_ids[1:],
-                        branch_length=self.num_branch_token * 2,
-                        mode="input",
-                        idx=self.rids[r.rid],
-                    )
-            return logits_output, next_token_ids, model_worker_batch, 0
-
+    # TODO (Qinghao): Need to be invoked
     def finish_request(self, reqs: Union[Req, List[Req]]):
         if not isinstance(reqs, List):
             reqs = [reqs]
