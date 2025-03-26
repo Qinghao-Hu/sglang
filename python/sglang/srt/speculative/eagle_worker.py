@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
+import time
 
 from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
 from sglang.srt.layers.dp_attention import disable_dp_size
@@ -233,19 +234,46 @@ class EAGLEWorker(TpModelWorker):
             the batch id (used for overlap schedule), and number of accepeted tokens.
         """
         if batch.forward_mode.is_decode():
+            # print(batch)
+            torch.cuda.synchronize()
+            st = time.time()
+            torch.cuda.nvtx.range_push("EAGLEWorker::forward_batch_speculative_generation")
+
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info, to_free_cache_loc = self.draft(batch)
+
+            torch.cuda.synchronize()
+            ed = time.time()
+            torch.cuda.nvtx.range_pop()
+            print(f"Draft time: {(ed - st)*1000:.2f}ms")
+
+            torch.cuda.synchronize()
+            st = time.time()
+            torch.cuda.nvtx.range_push("EAGLEWorker::verify")
             logits_output, verify_output, model_worker_batch = self.verify(
                 batch, spec_info
             )
+            torch.cuda.synchronize()
+            ed = time.time()
+            torch.cuda.nvtx.range_pop()
+            print(f"Verify time: {(ed - st)*1000:.2f}ms")
 
             # Free cache loc (we put it here to avoid synchronization and hide kernel launch overhead.)
             self.token_to_kv_pool_allocator.free(to_free_cache_loc)
 
+
+            torch.cuda.synchronize()
+            st = time.time()
+            torch.cuda.nvtx.range_push("EAGLEWorker::forward_draft_extend_after_decode")
             # If it is None, it means all requests are finished
             if batch.spec_info.verified_id is not None:
                 with self.draft_tp_context(self.draft_model_runner.tp_group):
                     self.forward_draft_extend_after_decode(batch)
+            torch.cuda.synchronize()
+            ed = time.time()
+            torch.cuda.nvtx.range_pop()
+            print(f"Draft Extend time: {(ed - st)*1000:.2f}ms")
+
             return (
                 logits_output,
                 verify_output.verified_id,
@@ -293,6 +321,10 @@ class EAGLEWorker(TpModelWorker):
         return logits_output, next_token_ids, model_worker_batch.bid
 
     def draft(self, batch: ScheduleBatch):
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("draft_preparation")
+
         # Parse args
         num_seqs = batch.batch_size()
         spec_info = batch.spec_info
@@ -321,12 +353,22 @@ class EAGLEWorker(TpModelWorker):
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+
         # Get forward batch
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("draft_model_ForwardBatch_init_1")
+        
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
@@ -335,11 +377,25 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch
             )
         else:
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_push("draft_model_init_attn_backend")
+            
             # Initialize attention backend
             self.draft_attn_backend.init_forward_metadata(forward_batch)
+
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_push("draft_model_ForwardBatch_init_2")
+
             forward_batch = ForwardBatch.init_new(
                 model_worker_batch, self.draft_model_runner
             )
+
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+
             # Run forward steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
 
@@ -376,6 +432,10 @@ class EAGLEWorker(TpModelWorker):
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
+            # NOTE: Select top k tokens for next round generation
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_push(f"select_top_k_tokens")
+
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -383,9 +443,16 @@ class EAGLEWorker(TpModelWorker):
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
 
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:
                 break
+
+
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_push(f"draft_model_fwd_prepare")
 
             # Set inputs
             forward_batch.input_ids = input_ids
@@ -397,10 +464,23 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+
             # Run forward
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_push(f"draft_model_runner.model.forward")
+
             logits_output = self.draft_model_runner.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch
             )
+
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_push(f"draft_model_runner.model.post_process")
+
             self._detect_nan_if_needed(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
@@ -408,21 +488,40 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+
         return score_list, token_list, parents_list
 
+    # @torch.compile(mode="reduce-overhead", dynamic=True)  # NOTE: Seems incompatible
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("verify_preparation")
+
         spec_info.prepare_for_verify(batch)
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
         model_worker_batch = batch.get_model_worker_batch()
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+
         logits_output, _ = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True
         )
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("spec_info.verify")
+
         self._detect_nan_if_needed(logits_output)
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
             batch, logits_output, self.token_to_kv_pool_allocator
         )
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepeted)
@@ -531,6 +630,7 @@ class EAGLEWorker(TpModelWorker):
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
+        # Update the KV Cache of the verified tokens.
         # Backup fileds that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
         req_pool_indices_backup = batch.req_pool_indices
@@ -538,6 +638,9 @@ class EAGLEWorker(TpModelWorker):
         return_logprob_backup = batch.return_logprob
 
         # Prepare metadata
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("forward_draft_extend_after_decode:spec_info")
+
         batch.forward_mode = ForwardMode.DRAFT_EXTEND
         batch.spec_info.prepare_extend_after_decode(
             batch,
@@ -545,10 +648,20 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         batch.return_logprob = False
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("forward_draft_extend_after_decode:init_batch")        
+
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
 
         # Run
         logits_output = self.draft_model_runner.forward(forward_batch)

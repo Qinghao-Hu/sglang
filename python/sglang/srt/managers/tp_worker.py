@@ -168,8 +168,22 @@ class TpModelWorker:
         launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
     ) -> Tuple[LogitsProcessorOutput, Optional[torch.Tensor]]:
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push(f"forward_batch_generation:ForwardBatch.init_new")
+
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push(f"forward_batch_generation:model_runner.forward")
+        
         logits_output = self.model_runner.forward(forward_batch)
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+
         if launch_done:
             launch_done.set()
 

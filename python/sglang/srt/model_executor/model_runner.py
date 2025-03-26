@@ -932,32 +932,60 @@ class ModelRunner:
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
+    # @torch.compile(mode="reduce-overhead", dynamic=True)  # NOTE: Seems incompatible
     def forward_extend(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ):
+        # NOTE: self.is_generation is always True in our setting.
+        
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("forward_extend:init_forward_metadata")
+
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
+        
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+
+        # import inspect
+        # print(inspect.getsource(self.model.__class__))
+        # print(inspect.getfile(self.model.__class__))
+        # print(inspect.getsourcelines(self.model.__class__)[1])
 
         if self.is_generation:
             if forward_batch.input_embeds is None:
-                return self.model.forward(
+                torch.cuda.synchronize()
+                torch.cuda.nvtx.range_push("forward_extend:model_forward_1")
+
+                out = self.model.forward(
                     forward_batch.input_ids, forward_batch.positions, forward_batch
                 )
+
+                torch.cuda.synchronize()
+                torch.cuda.nvtx.range_pop()
+                return out
             else:
-                return self.model.forward(
+                torch.cuda.synchronize()
+                torch.cuda.nvtx.range_push("forward_extend:model_forward_2")
+
+                out = self.model.forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
                     forward_batch,
                     input_embeds=forward_batch.input_embeds.bfloat16(),
                 )
+                torch.cuda.synchronize()
+                torch.cuda.nvtx.range_pop()                
+                return out
         else:
             # Only embedding models have get_embedding parameter
-            return self.model.forward(
+            out = self.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 get_embedding=True,
             )
+            return out
 
     def forward_idle(self, forward_batch: ForwardBatch):
         return self.model.forward(
@@ -968,6 +996,10 @@ class ModelRunner:
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
         cuda_graph_runner = self.cuda_graph_runner
+        # forward_batch.forward_mode: Always in [ForwardMode.DRAFT_EXTEND, ForwardMode.TARGET_VERIFY] in our settings. 
+        #   ForwardMode.TARGET_VERIFY goes to is_cuda_graph() branch if cuda graph is enabled.
+        #   ForwardMode.DRAFT_EXTEND goes to is_extend() branch.
+        # print(forward_batch.forward_mode, forward_batch.forward_mode.is_cuda_graph() and cuda_graph_runner and cuda_graph_runner.can_run(forward_batch))
         if forward_batch.spec_algorithm.is_lookahead():
             cuda_graph_runner = self.cuda_graph_runner_spec
 

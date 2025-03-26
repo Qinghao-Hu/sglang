@@ -535,12 +535,18 @@ class CudaGraphRunner:
     def replay(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push(f"cuda_graph_runner:replay_prepare")
+
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch)
         else:
             # In speculative decoding, these two fields are still needed.
             self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
 
         # Replay
         self.graphs[self.bs].replay()

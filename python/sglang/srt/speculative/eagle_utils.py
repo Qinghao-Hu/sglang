@@ -191,6 +191,7 @@ class EagleVerifyInput:
         spec_steps: int,
         num_verify_tokens: int,
     ):
+        # print("build_tree_kernel_efficient called here")
         (
             tree_mask,
             position,

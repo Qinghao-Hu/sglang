@@ -304,13 +304,24 @@ class LlamaModel(nn.Module):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states + residual)
             layer = self.layers[i]
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_push(f"llama_layer_{i}")
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
             )
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push(f"Last_norm_llama")
+
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
 
         if len(aux_hidden_states) == 0:
             return hidden_states
