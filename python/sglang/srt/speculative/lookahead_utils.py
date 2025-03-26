@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Type
+from typing import TYPE_CHECKING, List, Type, Optional
 
 import numpy as np
 import torch
 import triton
 import triton.language as tl
 
+from dataclasses import dataclass
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -15,7 +16,7 @@ from sglang.srt.speculative.eagle_utils import (
     assign_req_to_token_pool,
     create_flashinfer_kv_indices_triton,
 )
-
+from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 
 # TODO (Qinghao): Update to new Eagle VerifyInput Implementation
 class LookaheadVerifyInput:
@@ -80,7 +81,12 @@ class LookaheadVerifyInput:
         )
         return kv_indices, cum_kv_seq_len, self.qo_indptr, self.custom_mask
 
-    def verify(self, batch: ScheduleBatch, logits_output: torch.Tensor) -> torch.Tensor:
+    def verify(
+        self,
+        batch: ScheduleBatch,
+        logits_output: torch.Tensor,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+    ) -> torch.Tensor:
         bs = self.retrive_cum_len.numel() - 1
         predict = torch.argmax(logits_output.next_token_logits, dim=-1)
         predict = torch.cat([predict, torch.full([1], -1, dtype=torch.long, device="cuda")], dim=-1)
@@ -142,7 +148,7 @@ class LookaheadVerifyInput:
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index_flatten] = False
         mem_need_free_idx = batch.out_cache_loc[evict_mask]
-        batch.token_to_kv_pool.free(mem_need_free_idx)
+        token_to_kv_pool_allocator.free(mem_need_free_idx)
 
         last_verified_ids = []
         accept_token_bs = []
