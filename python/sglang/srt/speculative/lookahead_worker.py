@@ -179,6 +179,7 @@ class LOOKAHEADWorker:
 
     # TODO (Qinghao): Need to be invoked
     def finish_request(self, reqs: Union[Req, List[Req]]):
+        # print("Finish request Called")
         if not isinstance(reqs, List):
             reqs = [reqs]
         for req in reqs:

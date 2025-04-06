@@ -1353,6 +1353,9 @@ class Scheduler(
 
             retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
             self.new_token_ratio = new_token_ratio
+            print(9832719749)
+            if self.draft_worker:
+                self.draft_worker.finish_request(retracted_reqs)
 
             logger.info(
                 "Decode out of memory happened. "

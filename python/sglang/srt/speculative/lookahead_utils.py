@@ -162,6 +162,7 @@ class LookaheadVerifyInput:
             req.check_finished()
             # need to append the token for scheduler process_batch_result_decode to work
             last_verified_ids.append(req.output_ids[-1])
+            req.spec_verify_ct += 1
 
         verified_id = predict[accept_index_flatten]
         verified_id_cpu = verified_id.tolist()

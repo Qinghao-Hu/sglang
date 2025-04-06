@@ -509,6 +509,9 @@ class SchedulerOutputProcessorMixin:
                     and not self.model_config.is_multimodal_gen
                 )
             ):
+                if self.draft_worker and req.finished():
+                    if hasattr(self.draft_worker, "finish_request"):
+                        self.draft_worker.finish_request(req)
                 rids.append(req.rid)
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
