@@ -72,7 +72,12 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
+
+from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.speculative.eagle_worker import EAGLEWorker
+from sglang.srt.speculative.eagle_utils import EagleDraftInput
 import csv
+
 
 @dataclasses.dataclass
 class BenchArgs:
@@ -89,7 +94,7 @@ class BenchArgs:
     cut_len: int = 4
     profile: bool = False
     profile_filename_prefix: str = "profile"
-    result_csv_filename: str = "vanilla_benchmark_results.csv"
+    result_csv_filename: str = "spec_benchmark_results.csv"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -128,13 +133,15 @@ class BenchArgs:
             **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
         )
 
-def write_results_to_csv(csv_filename, results, tp_size):
+
+def write_results_to_csv(csv_filename, results, tp_size, spec_num_steps):
     file_exists = os.path.isfile(csv_filename)
     with open(csv_filename, mode='a', newline='') as csvfile:
         fieldnames = [
             'run_name', 'cuda_graph', 'batch_size', 'tp_size', 'input_len', 'output_len',
-            'prefill_latency', 'median_decode_latency',
-            'prefill_throughput', 'median_decode_throughput'
+            'sim_acc_tokens', 'exact_avg_acc_tokens', 'spec_num_steps', 'tokens_to_verify', 
+            'prefill_latency', 'avg_decode_latency',
+            'prefill_throughput', 'avg_decode_throughput',
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
@@ -149,38 +156,41 @@ def write_results_to_csv(csv_filename, results, tp_size):
                 'tp_size': tp_size,
                 'input_len': res['input_len'],
                 'output_len': res['output_len'],
+                'sim_acc_tokens': res.get('sim_acc_tokens', ''),
+                'exact_avg_acc_tokens': res.get('exact_avg_acc_tokens', ''),
+                'spec_num_steps': spec_num_steps,
+                'tokens_to_verify': res.get('tokens_to_verify', ''),
                 'prefill_latency': res['prefill_latency'],
-                'median_decode_latency': res.get('median_decode_latency', ''),
+                'avg_decode_latency': res.get('avg_decode_latency', ''),
                 'prefill_throughput': res['prefill_throughput'],
-                'median_decode_throughput': res.get('median_decode_throughput', '')
+                'avg_decode_throughput': res.get('avg_decode_throughput', ''),
             })
-
 
 
 def load_model(server_args, port_args, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
-    model_config = ModelConfig(
-        server_args.model_path,
-        trust_remote_code=server_args.trust_remote_code,
-        revision=server_args.revision,
-        context_length=server_args.context_length,
-        model_override_args=server_args.json_model_override_args,
-        is_embedding=server_args.is_embedding,
-        dtype=server_args.dtype,
-        quantization=server_args.quantization,
-    )
-    model_runner = ModelRunner(
-        model_config=model_config,
-        mem_fraction_static=server_args.mem_fraction_static,
+    # NOTE (Shang): Init Eagle Draft Model here.
+    # NOTE (Shang): dp is not considered yet
+    tp_worker = TpModelWorker(
+        server_args=server_args,
         gpu_id=tp_rank,
         tp_rank=tp_rank,
-        tp_size=server_args.tp_size,
+        dp_rank=0,
         nccl_port=port_args.nccl_port,
-        server_args=server_args,
     )
-    rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
+
+    draft_worker = EAGLEWorker(
+        gpu_id=tp_rank,
+        tp_rank=tp_rank,
+        server_args=server_args,
+        nccl_port=port_args.nccl_port,
+        target_worker=tp_worker,
+        dp_rank=0,
+    )
+
+    rank_print(f"max_total_num_tokens={tp_worker.model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
         server_args.tokenizer_path,
         tokenizer_mode=server_args.tokenizer_mode,
@@ -188,7 +198,7 @@ def load_model(server_args, port_args, tp_rank):
     )
     if server_args.tp_size > 1:
         dist.barrier()
-    return model_runner, tokenizer
+    return tp_worker.model_runner, tokenizer, draft_worker
 
 
 def prepare_inputs_for_correctness_test(bench_args, tokenizer):
@@ -259,7 +269,7 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len, bench_args)
 
 
 @torch.no_grad
-def extend(reqs, model_runner): # Prefill
+def extend(reqs, model_runner, draft_worker, server_args): # Prefill
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
@@ -267,13 +277,19 @@ def extend(reqs, model_runner): # Prefill
         tree_cache=None,
         model_config=model_runner.model_config,
         enable_overlap=False,
-        spec_algorithm=SpeculativeAlgorithm.NONE,
+        spec_algorithm=SpeculativeAlgorithm.from_string(server_args.speculative_algorithm),
         enable_custom_logit_processor=False,
     )
+
     batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output = model_runner.forward(forward_batch)
+    (
+        logits_output,
+        next_token_ids,
+        bid,
+        num_accepted_tokens,
+    ) = draft_worker.forward_batch_speculative_generation(batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
 
@@ -288,6 +304,23 @@ def decode(input_token_ids, batch, model_runner):
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
 
+@torch.no_grad
+def sim_verify(batch_size, input_token_ids, batch, model_runner, draft_worker, server_args):
+    batch.output_ids = input_token_ids
+    batch.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    batch.prepare_for_decode()
+    (
+        logits_output,
+        next_token_ids,
+        bid,
+        num_accepted_tokens,
+    ) = draft_worker.forward_batch_speculative_generation(batch)
+  
+    batch.output_ids = next_token_ids
+    
+    new_gen_tokens = (num_accepted_tokens // batch_size) + 1
+
+    return next_token_ids, logits_output.next_token_logits, new_gen_tokens
 
 def correctness_test(
     server_args,
@@ -300,7 +333,7 @@ def correctness_test(
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
+    model_runner, tokenizer, draft_worker = load_model(server_args, port_args, tp_rank)
 
     # Prepare inputs
     input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer)
@@ -308,7 +341,7 @@ def correctness_test(
 
     if bench_args.cut_len > 0:
         # Prefill
-        next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
+        next_token_ids, next_token_logits, batch = extend(reqs, model_runner, draft_worker)
         rank_print(f"prefill logits (first half): {next_token_logits} \n")
 
     # Prepare extend inputs
@@ -317,7 +350,7 @@ def correctness_test(
     )
 
     # Extend (prefill w/ KV cache)
-    next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
+    next_token_ids, next_token_logits, batch = extend(reqs, model_runner, draft_worker)
     rank_print(f"prefill logits (final): {next_token_logits} \n")
 
     # Decode
@@ -349,6 +382,9 @@ def latency_test_run_once(
     device,
     profile,
     profile_filename_prefix,
+    draft_worker,
+    tokens_to_verify,
+    server_args,
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
     if batch_size > max_batch_size:
@@ -366,6 +402,7 @@ def latency_test_run_once(
         "batch_size": batch_size,
         "input_len": input_len,
         "output_len": output_len,
+        "tokens_to_verify": tokens_to_verify,
     }
 
     tot_latency = 0
@@ -384,7 +421,7 @@ def latency_test_run_once(
     # Prefill
     synchronize(device)
     tic = time.time()
-    next_token_ids, _, batch = extend(reqs, model_runner)
+    next_token_ids, _, batch = extend(reqs, model_runner, draft_worker, server_args)
     synchronize(device)
     prefill_latency = time.time() - tic
     tot_latency += prefill_latency
@@ -397,19 +434,28 @@ def latency_test_run_once(
 
     # Decode
     decode_latencies = []
-    for i in range(output_len - 1):
+    decode_acc_lens = []
+    token_idx = 0
+    iter_round = 0
+    while token_idx < output_len:
         synchronize(device)
         tic = time.time()
-        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+
+        next_token_ids, _, new_gen_tokens = sim_verify(batch_size, next_token_ids, batch, model_runner, draft_worker, server_args)
+
+        token_idx += new_gen_tokens
+
         synchronize(device)
         latency = time.time() - tic
         tot_latency += latency
-        throughput = batch_size / latency
+        throughput = batch_size * new_gen_tokens / latency  
         decode_latencies.append(latency)
-        if i < 5:
+        decode_acc_lens.append(new_gen_tokens)
+        if iter_round < 5:
             rank_print(
                 f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
+        iter_round +=1
 
     if profile:
         profiler.stop()
@@ -420,19 +466,34 @@ def latency_test_run_once(
         rank_print(f"torch profiler chrome trace saved to {profile_filename}")
 
     # Record decode timing from 2nd output
-    if output_len > 1:
-        med_decode_latency = np.median(decode_latencies)
-        med_decode_throughput = batch_size / med_decode_latency
+    # if output_len > 1:
+    #     med_decode_latency = np.median(decode_latencies)
+    #     med_decode_throughput = batch_size * max_new_gen_tokens / med_decode_latency    # use max_new_gen_tokens for throughput calculation avoid the effect of last output token length's effect
+    #     rank_print(
+    #         f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
+    #     )
+    #     measurement_results["median_decode_latency"] = med_decode_latency
+    #     measurement_results["median_decode_throughput"] = med_decode_throughput
+    #     measurement_results["new_gen_tokens"] = max_new_gen_tokens
+
+    if output_len > 1:  # Average decode latency stats
+        tot_decode_latency = tot_latency - prefill_latency
+        avg_decode_latency = np.mean(decode_latencies)
+        assert np.sum(decode_acc_lens) == output_len, f"Sum of decoded tokens should be equal to the output_len, now {np.sum(decode_acc_lens)} != {output_len}"
+        avg_decode_throughput = batch_size * output_len / tot_decode_latency
         rank_print(
-            f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
+            f"Decode.  average latency (per_step): {avg_decode_latency:6.5f} s, average throughput: {avg_decode_throughput:9.2f} token/s"
         )
-        measurement_results["median_decode_latency"] = med_decode_latency
-        measurement_results["median_decode_throughput"] = med_decode_throughput
+        measurement_results["avg_decode_latency"] = avg_decode_latency
+        measurement_results["avg_decode_throughput"] = avg_decode_throughput
+        measurement_results["sim_acc_tokens"] = float(os.environ.get("SIMULATE_ACC_LEN"))
+        measurement_results["exact_avg_acc_tokens"] = np.mean(decode_acc_lens)
+
 
     throughput = (input_len + output_len) * batch_size / tot_latency
-    rank_print(
-        f"Total. latency: {tot_latency:6.3f} s, throughput: {throughput:9.2f} token/s"
-    )
+    # rank_print(
+    #     f"Total. latency: {tot_latency:6.3f} s, throughput: {throughput:9.2f} token/s"
+    # )
     measurement_results["total_latency"] = tot_latency
     measurement_results["overall_throughput"] = throughput
     return measurement_results
@@ -453,7 +514,7 @@ def latency_test(
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
+    model_runner, tokenizer, draft_worker = load_model(server_args, port_args, tp_rank)
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
@@ -474,6 +535,9 @@ def latency_test(
         server_args.device,
         profile=False,
         profile_filename_prefix="",  # not used
+        draft_worker=draft_worker,
+        tokens_to_verify=server_args.speculative_num_draft_tokens,
+        server_args=server_args,
     )
 
     rank_print("Benchmark ...")
@@ -496,6 +560,9 @@ def latency_test(
         server_args.device,
         bench_args.profile if tp_rank == 0 else None,
         bench_args.profile_filename_prefix,
+        draft_worker,
+        server_args.speculative_num_draft_tokens,
+        server_args,
     )
     if ret is not None:
         result_list.append(ret)
@@ -505,9 +572,9 @@ def latency_test(
         with open(bench_args.result_filename, "a") as fout:
             for result in result_list:
                 fout.write(json.dumps(result) + "\n")
-
+    
     if tp_rank == 0 and bench_args.result_csv_filename:
-        write_results_to_csv(bench_args.result_csv_filename, result_list, server_args.tp_size)
+        write_results_to_csv(bench_args.result_csv_filename, result_list, server_args.tp_size, server_args.speculative_num_steps)
 
 
 def main(server_args, bench_args):

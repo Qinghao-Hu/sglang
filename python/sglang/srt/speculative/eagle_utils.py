@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
+SIMULATE_ACC_LEN_STD = os.environ.get("SIMULATE_ACC_LEN_STD", 1.0)
 
 
 @dataclass
@@ -412,6 +413,7 @@ class EagleVerifyInput:
                 predict=predict,  # mutable
                 accept_length=accept_length,  # mutable
                 simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_len_std=SIMULATE_ACC_LEN_STD,
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
@@ -787,13 +789,15 @@ def _generate_simulated_accept_index(
     predict,
     accept_length,
     simulate_acc_len,
+    simulate_acc_len_std,
     bs,
     spec_steps,
 ):
     simulate_acc_len_float = float(simulate_acc_len)
+    simulate_acc_len_std = float(simulate_acc_len_std)
     simulated_values = torch.normal(
         mean=simulate_acc_len_float,
-        std=1.0,
+        std=simulate_acc_len_std,
         size=(1,),
         device="cpu",
     )

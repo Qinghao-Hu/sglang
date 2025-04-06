@@ -578,7 +578,7 @@ class Req:
                 return
 
         # Check stop strings
-        if len(self.sampling_params.stop_strs) > 0:
+        if self.sampling_params.stop_strs is not None and len(self.sampling_params.stop_strs) > 0:
             tail_str = self.tokenizer.decode(
                 self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
             )
