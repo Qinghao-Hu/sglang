@@ -599,9 +599,11 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
+            # NOTE (Shang): PLD calls here
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
+            # NOTE (Shang): PLD run_batch is here!
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
@@ -1188,6 +1190,7 @@ class Scheduler(
         else:
             # Run decode
             if not self.running_batch.is_empty():
+                # NOTE (Shang): PLD calls here.
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -1353,7 +1356,6 @@ class Scheduler(
 
             retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
             self.new_token_ratio = new_token_ratio
-            print(9832719749)
             if self.draft_worker:
                 self.draft_worker.finish_request(retracted_reqs)
 
@@ -1373,6 +1375,7 @@ class Scheduler(
             batch.batch_is_full = False
 
         if self.spec_algorithm.is_lookahead():
+            # NOTE (Shang): Prepare for lookahead speculative generation here.
             batch.spec_info = self.draft_worker.prepare_for_verify(batch)
 
         # Update batch tensors

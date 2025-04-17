@@ -137,7 +137,8 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, is_spec=False):
         ]
 
     capture_bs = list(sorted(set(capture_bs)))
-    if is_spec:
+    # if is_spec:
+    if False:
         # For speculative inference, large batch sizes are not effective.
         capture_bs = [1, 2, 3, 4, 5, 6, 7, 8]
     else:
@@ -480,6 +481,9 @@ class CudaGraphRunner:
             self.capture()
 
     def replay_prepare(self, forward_batch: ForwardBatch):
+
+        # print("Replay prepare: bs = ", forward_batch.batch_size, raw_bs)
+
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
@@ -544,6 +548,9 @@ class CudaGraphRunner:
             # In speculative decoding, these two fields are still needed.
             self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
+
+        # print("forward_batch:", forward_batch.batch_size)
+        # print("self.bs:", self.bs)
 
         # Replay
         self.graphs[self.bs].replay()

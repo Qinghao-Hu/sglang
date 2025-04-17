@@ -88,10 +88,12 @@ class LookaheadVerifyInput:
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
     ) -> torch.Tensor:
         bs = self.retrive_cum_len.numel() - 1
+        # print("bs", bs)
+        # print("logits_output", logits_output.next_token_logits)
         predict = torch.argmax(logits_output.next_token_logits, dim=-1)
-        predict = torch.cat([predict, torch.full([1], -1, dtype=torch.long, device="cuda")], dim=-1)
+        predict = torch.cat([predict, torch.full([1], -1, dtype=torch.long, device=predict.device)], dim=-1)
         draft_token = torch.cat(
-            [self.draft_token, torch.full([1], -1, dtype=torch.long, device="cuda")],
+            [self.draft_token, torch.full([1], -1, dtype=torch.long, device=self.draft_token.device)],
             dim=-1,
         )
         target_predict = predict[self.retrive_index]
@@ -100,9 +102,9 @@ class LookaheadVerifyInput:
         accept_mask = (torch.cumprod(accept_mask, dim=1)).sum(dim=1)
 
         max_draft_len = self.retrive_index.shape[-1]
-        accept_index = torch.full((bs, max_draft_len), -1, dtype=torch.long, device="cuda")
-        accept_length = torch.empty((bs,), dtype=torch.int, device="cuda")
-        extract_index = torch.full((bs * 2,), 0, dtype=torch.int, device="cuda")
+        accept_index = torch.full((bs, max_draft_len), -1, dtype=torch.long, device=predict.device)
+        accept_length = torch.empty((bs,), dtype=torch.int, device=predict.device)
+        extract_index = torch.full((bs * 2,), 0, dtype=torch.int, device=predict.device)
         eagle_verify_retrive[(bs,)](
             self.retrive_index.contiguous(),
             accept_mask.contiguous(),
@@ -152,6 +154,7 @@ class LookaheadVerifyInput:
 
         last_verified_ids = []
         accept_token_bs = []
+        # print(bs)
         for i in range(bs):
             req = batch.reqs[i]
             accept_ids = torch.where(accept_index[i] != -1)[0]
@@ -170,6 +173,14 @@ class LookaheadVerifyInput:
         last_verified_ids = torch.tensor(last_verified_ids, device="cuda")
         logits_output.next_token_logits = logits_output.next_token_logits[accept_index_flatten]
         return logits_output, last_verified_ids, accept_length.sum().item()
+
+    def filter_batch(self, new_indices: torch.Tensor):
+        # self.topk_p = self.topk_p[: len(new_indices)]
+        # self.topk_index = self.topk_index[: len(new_indices)]
+        # self.hidden_states = self.hidden_states[: len(new_indices)]
+        # self.verified_id = self.verified_id[: len(new_indices)]
+        # NOTE (Shang): Not sure if this is the correct way to do it (TODO here)
+        return
 
     def merge_batch(self, spec_info: LookaheadVerifyInput):
         return

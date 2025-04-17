@@ -47,6 +47,7 @@ class LOOKAHEADWorker:
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
 
     def forward_batch_speculative_generation(self, batch: ScheduleBatch) -> Tuple[LogitsProcessorOutput, List[int], int, int]:
+        # print(batch.forward_mode)
         if batch.forward_mode.is_target_verify():
             verify_input = batch.spec_info
             model_worker_batch = batch.get_model_worker_batch()
@@ -59,14 +60,16 @@ class LOOKAHEADWorker:
         else:
             model_worker_batch = batch.get_model_worker_batch()
             logits_output, next_token_ids = self.target_worker.forward_batch_generation(model_worker_batch)
+            # print(f"next_token_ids: {next_token_ids}", batch.forward_mode)
             if self.lookahead_cache is not None:
                 next_token_ids_cpu = next_token_ids.tolist()
+                # NOTE (Shang): Add to the lookahead cache (tree)
                 for r, token in zip(batch.reqs, next_token_ids_cpu):
-                    self.rids[r.rid] = len(self.rids)
+                    self.rids[r.rid] = len(self.rids)       # Map req id to number index
                     put_ids = r.fill_ids + [token]
                     self.lookahead_cache.put(
                         put_ids[1:],
-                        branch_length=self.num_branch_token * 2,
+                        branch_length=self.num_branch_token * 2,    # TODO (Shang): Why need *2 here?
                         mode="input",
                         idx=self.rids[r.rid],
                     )
@@ -94,8 +97,9 @@ class LOOKAHEADWorker:
             seq_lens.append(seq_len)
             if self.lookahead_cache is not None:
                 check_token = fill_ids[-self.num_branch_token :]
-                # make total_draft_len 2^n
+                # make total_draft_len 2^n [up-cast to the next power of 2]
                 total_draft_len = 2 ** ((self.num_branch_token * 4 // bs) - 1).bit_length()
+                # print(self.one_branch, total_draft_len <= self.num_branch_token)
                 is_one_branch = self.one_branch or total_draft_len <= self.num_branch_token
                 if is_one_branch:
                     req_drafts, mask, _ = self.lookahead_cache.one_get(
@@ -103,6 +107,7 @@ class LOOKAHEADWorker:
                         branch_length=self.num_branch_token,
                         idx=self.rids[req.rid],
                     )
+                    # print(f"One branch get: {req_drafts},\n {mask}")
                 else:
                     req_drafts, mask, _ = self.lookahead_cache.hier_get(
                         check_token,
@@ -110,6 +115,7 @@ class LOOKAHEADWorker:
                         branch_length=self.num_branch_token,
                         decoding_length=total_draft_len,
                     )
+                    # print(f"Hierarchical get: {req_drafts},\n {mask}")
                 data = broadcast_pyobj(
                     [req_drafts, mask],
                     self.tp_rank,
