@@ -57,10 +57,12 @@ class HttpServerEngineAdapter(EngineBase):
 
     def __init__(self, **kwargs):
         self.server_args = ServerArgs(**kwargs)
-        print(f"launch_server_from_verl_engine {self.server_args.port}")
+        print(
+            f"Launch HttpServerEngineAdapter at: {self.server_args.host}:{self.server_args.port}"
+        )
         self.process = launch_server_process(self.server_args)
 
-    def _make_request(self, endpoint: str, payload: dict = None):
+    def _make_request(self, endpoint: str, payload: Optional[dict] = None):
         """Make a POST request to the specified endpoint with the given payload.
 
         Args:
@@ -82,7 +84,7 @@ class HttpServerEngineAdapter(EngineBase):
         flush_cache: bool = False,
     ):
         """
-        Update model weights from tensor data. The HTTPS server will only post meta data, and the real weights will be copied directly from GPUs.
+        Update model weights from tensor data. The HTTP server will only post meta data, and the real weights will be copied directly from GPUs.
 
         Note: The model should be on GPUs rather than CPU for this functionality to work properly.
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
