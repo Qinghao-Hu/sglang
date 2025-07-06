@@ -5,6 +5,7 @@ import copy
 import logging
 import os
 import random
+import re
 import subprocess
 import threading
 import time
@@ -37,6 +38,7 @@ from sglang.utils import get_exception_traceback
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = "meta-llama/Llama-3.2-1B"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
 
@@ -839,12 +841,23 @@ def run_bench_one_batch(model, other_args):
         print(f"Output: {output}", flush=True)
         print(f"Error: {error}", flush=True)
 
-        lastline = output.split("\n")[-3]
-        output_throughput = float(lastline.split(" ")[-2])
+        # Return prefill_latency, decode_throughput, decode_latency
+        prefill_line = output.split("\n")[-9]
+        decode_line = output.split("\n")[-3]
+        pattern = (
+            r"latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
+        )
+        match = re.search(pattern, prefill_line)
+        if match:
+            prefill_latency = float(match.group("latency"))
+        match = re.search(pattern, decode_line)
+        if match:
+            decode_latency = float(match.group("latency"))
+            decode_throughput = float(match.group("throughput"))
     finally:
         kill_process_tree(process.pid)
 
-    return output_throughput
+    return prefill_latency, decode_throughput, decode_latency
 
 
 def run_bench_offline_throughput(model, other_args):
