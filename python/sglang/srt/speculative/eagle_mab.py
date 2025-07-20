@@ -1,5 +1,6 @@
 """Multi-Armed Bandit implementation for adaptive speculative decoding."""
 
+import logging
 import math
 import re
 from collections import deque
@@ -8,7 +9,7 @@ from typing import Deque, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
-
+logger = logging.getLogger(__name__)
 class MABConfig:
     """Class for handling MAB configuration validation and parsing."""
 
@@ -193,6 +194,49 @@ class UCB1MAB(BaseMAB):
         )
 
 
+class PredefinedMappingStrategy(BaseMAB):
+    """Simple predefined strategy selector based on batch size ranges."""
+
+    def __init__(self, strategies: List[str], **kwargs):
+        super().__init__(strategies, **kwargs)
+
+        assert len(strategies) == 4, "PredefinedMappingStrategy requires exactly 4 strategies."
+
+        # Parse and sort strategies by draft_tokens (descending)
+        strategy_tokens_pairs = []
+        for strategy in strategies:
+            _, _, draft_tokens = MABConfig.parse_config(strategy)
+            strategy_tokens_pairs.append((strategy, draft_tokens))
+
+        strategy_tokens_pairs.sort(key=lambda x: x[1], reverse=True)
+        self.sorted_strategies = [pair[0] for pair in strategy_tokens_pairs]
+        self.sorted_tokens = [pair[1] for pair in strategy_tokens_pairs]
+
+        # Create batch size ranges and allocate strategies
+        self.batch_ranges = [
+            (1, 1, self.sorted_strategies[0]),  # Batch size 1: largest verify tokens (best speedup)
+            (2, 4, self.sorted_strategies[1]),
+            (5, 20, self.sorted_strategies[2]),
+            (21, float("inf"), self.sorted_strategies[3]),
+        ]
+
+        logger.info(f"FixedMappingStrategy initialized with sorted strategies (steps_topk_verifyTokens):")
+        for min_batch, max_batch, strategy in self.batch_ranges:
+            tokens = MABConfig.parse_config(strategy)[2]
+            range_str = (
+                f"{min_batch}"
+                if max_batch == min_batch
+                else f"{min_batch}-{max_batch if max_batch != float('inf') else '∞'}"
+            )
+            logger.info(f"  Batch {range_str}: {strategy} (verify {tokens} tokens)")
+
+    def select_strategy(self, batch_size: int = None) -> str:
+        """Choose strategy based on batch size"""
+        for min_batch, max_batch, strategy in self.batch_ranges:
+            if min_batch <= batch_size <= max_batch:
+                return strategy
+
+
 class MABGroupManager:
     """Manages groups and their associated MAB instances.
 
@@ -202,10 +246,9 @@ class MABGroupManager:
 
     # Map algorithm names to their factory functions
     ALGORITHM_FACTORIES = {
-        "EG": lambda strategies, window_size: EpsilonGreedyMAB(
-            strategies=strategies, window_size=window_size
-        ),
-        "UCB1": lambda strategies, window_size: UCB1MAB(
+        "EG": lambda strategies, window_size: EpsilonGreedyMAB(strategies=strategies, window_size=window_size),
+        "UCB1": lambda strategies, window_size: UCB1MAB(strategies=strategies, window_size=window_size),
+        "PREDEFINED": lambda strategies, window_size: PredefinedMappingStrategy(
             strategies=strategies, window_size=window_size
         ),
     }
@@ -294,12 +337,17 @@ class MABGroupManager:
         if len(self.strategies) == 1:
             return self.strategies[0]
 
-        # Get appropriate group and valid strategies
+        # Get appropriate group for all algorithms
         group = self._get_group(batch_size)
-        valid_strategies = self._get_valid_strategies(batch_size)
 
-        # Select strategy using the MAB algorithm
-        return self.mabs[group].select_strategy(valid_strategies)
+        if self.algorithm in ["PREDEFINED"]:
+            return self.mabs[group].select_strategy(batch_size)
+        else:
+            # Get valid strategies for other algorithms
+            valid_strategies = self._get_valid_strategies(batch_size)
+
+            # Select strategy using the MAB algorithm
+            return self.mabs[group].select_strategy(valid_strategies)
 
     def record_strategy_metrics(
         self, batch_size: int, strategy: str, reward: float, accept_length: float

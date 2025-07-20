@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Type, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List, Optional, Type
 
 import numpy as np
 import torch
 import triton
 import triton.language as tl
 
-from dataclasses import dataclass
-
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.speculative.eagle_utils import (
     assign_req_to_token_pool,
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
+
 
 # TODO (Qinghao): Update to new Eagle VerifyInput Implementation
 class LookaheadVerifyInput:

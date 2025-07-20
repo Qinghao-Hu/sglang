@@ -6,7 +6,6 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
-
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_tensor_model_parallel_world_size,
@@ -343,6 +342,7 @@ class EAGLEWorker(TpModelWorker):
                 strategy = self.select_mab_strategy(batch_size)
                 self.mab_last_pull["batch_size"] = batch_size
                 self.mab_last_pull["mab_strategy"] = strategy
+                logger.info(f"Using MAB strategy {strategy} for batch size {batch_size}, selecting topk {self.topk}")
 
             batch.spec_info.topk_p = batch.spec_info.topk_p[:, : self.topk]
             batch.spec_info.topk_index = batch.spec_info.topk_index[:, : self.topk]
@@ -955,6 +955,7 @@ class EAGLEWorker(TpModelWorker):
         steps, topk, draft_tokens = MABConfig.parse_config(mab_strategy)
         self.speculative_num_steps = steps
         self.topk = topk
+        self.speculative_num_draft_tokens = draft_tokens
         self.server_args.speculative_num_draft_tokens = draft_tokens
         self.target_worker.model_runner.server_args.speculative_num_steps = steps
         self.target_worker.model_runner.server_args.speculative_eagle_topk = topk
@@ -1050,6 +1051,9 @@ class EAGLEWorker(TpModelWorker):
             target_cuda_graph_runner=self.target_worker.model_runner.cuda_graph_runner,
         )
 
+        max_topk_needed = max(MABConfig.parse_config(strategy)[1] for strategy in self.mab_strategies)
+        self.max_topk = max(self.max_topk, max_topk_needed)
+
         # Parse additional MAB strategies if provided
         self.mab_strategies.extend(self.server_args.speculative_eagle_mab_configs)
         self.mab_strategies = sorted(list(set(self.mab_strategies)))
@@ -1076,7 +1080,7 @@ class EAGLEWorker(TpModelWorker):
 
             logging.info(f"Initializing MAB strategy {mab_strategy} resources")
             self.update_speculative_args(mab_strategy)
-            self.max_topk = max(self.max_topk, self.topk)
+            # self.max_topk = max(self.max_topk, self.topk)
 
             # Initialize draft worker resources
             with self.draft_tp_context(self.draft_model_runner.tp_group):

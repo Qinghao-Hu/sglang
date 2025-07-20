@@ -36,7 +36,6 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import torch
 import uvloop
-
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -517,6 +516,14 @@ class Engine(EngineBase):
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.release_memory_occupation(obj, None)
+        )
+
+    def release_memory_immediately(self, worker_id: int, tags: Optional[List[str]] = None):
+        obj = ReleaseMemoryOccupationReqInput(tags=tags)
+        all_tp_ranks = list(range(self.server_args.tp_size))
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.release_memory_occupation_async(obj, worker_ids=all_tp_ranks, wait_completion=False)
         )
 
     def resume_memory_occupation(self, tags: Optional[List[str]] = None):

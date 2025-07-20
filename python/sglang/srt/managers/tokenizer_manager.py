@@ -48,7 +48,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import (
@@ -319,6 +318,9 @@ class TokenizerManager:
         self.release_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.release_memory_occupation_async_communicator = _FlexibleCommunicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -437,9 +439,7 @@ class TokenizerManager:
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
-            logger.info(
-                f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
-            )
+            logger.info(f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}")
 
         async with self.model_update_lock.reader_lock:
             if obj.is_single:
@@ -448,9 +448,7 @@ class TokenizerManager:
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
-                async for response in self._handle_batch_request(
-                    obj, request, created_time
-                ):
+                async for response in self._handle_batch_request(obj, request, created_time):
                     yield response
 
     async def _tokenize_one_request(
@@ -462,9 +460,7 @@ class TokenizerManager:
         input_embeds = None
         input_text = obj.text
         token_type_ids = None
-        is_cross_encoder_request = (
-            isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
-        )
+        is_cross_encoder_request = isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         if obj.input_embeds is not None:
             if not self.server_args.disable_radix_cache:
                 raise ValueError(
@@ -483,9 +479,7 @@ class TokenizerManager:
                     "accept text prompts. Please provide input_ids or re-initialize "
                     "the engine with skip_tokenizer_init=False."
                 )
-            encoded = self.tokenizer(
-                input_text, return_token_type_ids=is_cross_encoder_request
-            )
+            encoded = self.tokenizer(input_text, return_token_type_ids=is_cross_encoder_request)
 
             input_ids = encoded["input_ids"]
             if is_cross_encoder_request:
@@ -510,13 +504,9 @@ class TokenizerManager:
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
-        )
+        return self._create_tokenized_object(obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids)
 
-    def _validate_one_request(
-        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
-    ) -> None:
+    def _validate_one_request(self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
 
         input_token_num = len(input_ids) if input_ids is not None else 0
@@ -529,10 +519,7 @@ class TokenizerManager:
 
         # Check total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
-        if (
-            max_new_tokens is not None
-            and (max_new_tokens + input_token_num) >= self.context_len
-        ):
+        if max_new_tokens is not None and (max_new_tokens + input_token_num) >= self.context_len:
             total_tokens = max_new_tokens + input_token_num
             error_msg = (
                 f"Requested token count exceeds the model's maximum context length "
@@ -544,18 +531,12 @@ class TokenizerManager:
             raise ValueError(error_msg)
 
         if isinstance(obj, GenerateReqInput):
-            if (
-                obj.return_hidden_states
-                and not self.server_args.enable_return_hidden_states
-            ):
+            if obj.return_hidden_states and not self.server_args.enable_return_hidden_states:
                 raise ValueError(
                     "The server is not configured to return the hidden states. "
                     "Please set `--enable-return-hidden-states` to enable this feature."
                 )
-            if (
-                obj.custom_logit_processor
-                and not self.server_args.enable_custom_logit_processor
-            ):
+            if obj.custom_logit_processor and not self.server_args.enable_custom_logit_processor:
                 raise ValueError(
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logits-processor` to enable this feature."
@@ -563,13 +544,9 @@ class TokenizerManager:
             if self.server_args.lora_paths and obj.lora_path:
                 self._validate_lora_adapters(obj)
 
-    def _validate_input_ids_in_vocab(
-        self, input_ids: List[int], vocab_size: int
-    ) -> None:
+    def _validate_input_ids_in_vocab(self, input_ids: List[int], vocab_size: int) -> None:
         if any(id >= vocab_size for id in input_ids):
-            raise ValueError(
-                f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
-            )
+            raise ValueError(f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size}).")
 
     def _create_tokenized_object(
         self,
@@ -594,9 +571,7 @@ class TokenizerManager:
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
-            session_params = (
-                SessionParams(**obj.session_params) if obj.session_params else None
-            )
+            session_params = SessionParams(**obj.session_params) if obj.session_params else None
 
             tokenized_obj = TokenizedGenerateReqInput(
                 obj.rid,
@@ -649,11 +624,7 @@ class TokenizerManager:
         tokenized_objs = []
         for i, req in enumerate(requests):
             self._validate_token_len(obj[i], input_ids_list[i])
-            tokenized_objs.append(
-                self._create_tokenized_object(
-                    req, req.text, input_ids_list[i], None, None
-                )
-            )
+            tokenized_objs.append(self._create_tokenized_object(req, req.text, input_ids_list[i], None, None))
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
@@ -663,9 +634,7 @@ class TokenizerManager:
         """Validate constraints for batch tokenization processing."""
         for i in range(batch_size):
             if self.is_generation and obj[i].contains_mm_input():
-                raise ValueError(
-                    "For multimodal input processing do not set `enable_tokenizer_batch_encode`."
-                )
+                raise ValueError("For multimodal input processing do not set `enable_tokenizer_batch_encode`.")
             if obj[i].input_ids is not None:
                 raise ValueError(
                     "Batch tokenization is not needed for pre-tokenized input_ids. Do not set `enable_tokenizer_batch_encode`."
@@ -677,12 +646,8 @@ class TokenizerManager:
 
     def _validate_lora_adapters(self, obj: GenerateReqInput):
         """Validate that the requested LoRA adapters are loaded."""
-        requested_adapters = (
-            set(obj.lora_path) if isinstance(obj.lora_path, list) else {obj.lora_path}
-        )
-        loaded_adapters = (
-            self.loaded_lora_adapters.keys() if self.loaded_lora_adapters else set()
-        )
+        requested_adapters = set(obj.lora_path) if isinstance(obj.lora_path, list) else {obj.lora_path}
+        loaded_adapters = self.loaded_lora_adapters.keys() if self.loaded_lora_adapters else set()
         unloaded_adapters = requested_adapters - loaded_adapters
         if unloaded_adapters:
             raise ValueError(
@@ -716,9 +681,7 @@ class TokenizerManager:
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
                     self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
-                    raise ValueError(
-                        f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
-                    )
+                    raise ValueError(f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}")
                 continue
 
             out = state.out_list[-1]
@@ -754,9 +717,7 @@ class TokenizerManager:
                     # Abort the request for disconnected requests (non-streaming, running)
                     self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
-                    raise ValueError(
-                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
-                    )
+                    raise ValueError(f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}")
 
     async def _handle_batch_request(
         self,
@@ -799,9 +760,7 @@ class TokenizerManager:
 
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
-            tokenized_objs = await asyncio.gather(
-                *(self._tokenize_one_request(obj) for obj in objs)
-            )
+            tokenized_objs = await asyncio.gather(*(self._tokenize_one_request(obj) for obj in objs))
 
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
@@ -833,9 +792,7 @@ class TokenizerManager:
             rid_to_index = {rid: i for i, rid in enumerate(rids)}
             task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
             while task_map:
-                done, _ = await asyncio.wait(
-                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
-                )
+                done, _ = await asyncio.wait(task_map.keys(), return_when=asyncio.FIRST_COMPLETED)
 
                 for task in done:
                     gen = task_map.pop(task)
@@ -938,9 +895,7 @@ class TokenizerManager:
             async with self.model_update_lock.writer_lock:
                 return await self._wait_for_model_update_from_disk(obj)
 
-    async def _wait_for_model_update_from_disk(
-        self, obj: UpdateWeightFromDiskReqInput
-    ) -> Tuple[bool, str]:
+    async def _wait_for_model_update_from_disk(self, obj: UpdateWeightFromDiskReqInput) -> Tuple[bool, str]:
         self.send_to_scheduler.send_pyobj(obj)
         self.model_update_result = asyncio.Future()
         if self.server_args.dp_size == 1:
@@ -971,9 +926,7 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for init parameter update group"
+        assert self.server_args.dp_size == 1, "dp_size must be 1 for init parameter update group"
         result = (await self.init_weights_update_group_communicator(obj))[0]
         return result.success, result.message
 
@@ -983,9 +936,9 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        assert self.server_args.dp_size == 1 or self.server_args.enable_dp_attention, (
+            "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        )
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
@@ -1002,9 +955,9 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+        assert self.server_args.dp_size == 1 or self.server_args.enable_dp_attention, (
+            "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+        )
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
@@ -1024,9 +977,7 @@ class TokenizerManager:
 
         # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
         # with dp_size > 1.
-        assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for dynamic lora loading"
+        assert self.server_args.dp_size == 1, "dp_size must be 1 for dynamic lora loading"
         logger.info(
             "Start load Lora adapter. Lora name=%s, path=%s",
             obj.lora_name,
@@ -1047,9 +998,7 @@ class TokenizerManager:
 
         # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
         # with dp_size > 1.
-        assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for dynamic lora loading"
+        assert self.server_args.dp_size == 1, "dp_size must be 1 for dynamic lora loading"
         logger.info(
             "Start unload Lora adapter. Lora name=%s",
             obj.lora_name,
@@ -1060,9 +1009,7 @@ class TokenizerManager:
             self.loaded_lora_adapters = result.loaded_adapters
             return result
 
-    async def get_weights_by_name(
-        self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
-    ):
+    async def get_weights_by_name(self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None):
         self.auto_create_handle_loop()
         results = await self.get_weights_by_name_communicator(obj)
         all_parameters = [r.parameter for r in results]
@@ -1078,6 +1025,27 @@ class TokenizerManager:
     ):
         self.auto_create_handle_loop()
         await self.release_memory_occupation_communicator(obj)
+
+    async def release_memory_occupation_async(
+        self,
+        obj: ReleaseMemoryOccupationReqInput,
+        worker_ids: Optional[List[int]] = None,
+        wait_completion: bool = False,
+    ):
+        if worker_ids:
+            # When calling without waiting for completion, we don't need a result.
+            # We just send the request to the scheduler.
+            if not wait_completion:
+                for worker_id in worker_ids:
+                    specific_obj = copy.copy(obj)
+                    specific_obj.target_worker = worker_id
+                    self.send_to_scheduler.send_pyobj(specific_obj)
+                return True
+
+        # For cases where we need to wait, we use the flexible communicator.
+        return await self.release_memory_occupation_async_communicator(
+            obj, target_workers=worker_ids, wait_all=wait_completion
+        )
 
     async def resume_memory_occupation(
         self,
@@ -1095,9 +1063,7 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
 
-    async def open_session(
-        self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
-    ):
+    async def open_session(self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None):
         self.auto_create_handle_loop()
 
         if obj.session_id is None:
@@ -1112,16 +1078,12 @@ class TokenizerManager:
         del self.session_futures[obj.session_id]
         return session_id
 
-    async def close_session(
-        self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
-    ):
+    async def close_session(self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None):
         await self.send_to_scheduler.send_pyobj(obj)
 
     async def get_internal_state(self) -> List[Dict[Any, Any]]:
         req = GetInternalStateReq()
-        responses: List[GetInternalStateReqOutput] = (
-            await self.get_internal_state_communicator(req)
-        )
+        responses: List[GetInternalStateReqOutput] = await self.get_internal_state_communicator(req)
         # Many DP ranks
         return [res.internal_state for res in responses]
 
@@ -1133,12 +1095,8 @@ class TokenizerManager:
                 self.current_load = internal_state[0]["load"]
         return {"load": self.current_load}
 
-    async def set_internal_state(
-        self, obj: SetInternalStateReq
-    ) -> SetInternalStateReqOutput:
-        responses: List[SetInternalStateReqOutput] = (
-            await self.set_internal_state_communicator(obj)
-        )
+    async def set_internal_state(self, obj: SetInternalStateReq) -> SetInternalStateReqOutput:
+        responses: List[SetInternalStateReqOutput] = await self.set_internal_state_communicator(obj)
         return [res.internal_state for res in responses]
 
     def get_log_request_metadata(self):
@@ -1190,9 +1148,7 @@ class TokenizerManager:
             elif self.log_requests_level == 3:
                 max_length = 1 << 30
             else:
-                raise ValueError(
-                    f"Invalid --log-requests-level: {self.log_requests_level=}"
-                )
+                raise ValueError(f"Invalid --log-requests-level: {self.log_requests_level=}")
         return max_length, skip_names, out_skip_names
 
     def configure_logging(self, obj: ConfigureLoggingReq):
@@ -1229,9 +1185,7 @@ class TokenizerManager:
 
         self.no_create_loop = True
         loop = asyncio.get_event_loop()
-        self.asyncio_tasks.add(
-            loop.create_task(print_exception_wrapper(self.handle_loop))
-        )
+        self.asyncio_tasks.add(loop.create_task(print_exception_wrapper(self.handle_loop)))
 
         self.event_loop = loop
 
@@ -1241,24 +1195,18 @@ class TokenizerManager:
             signal_handler = SignalHandler(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
-            loop.add_signal_handler(
-                signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
-            )
+            loop.add_signal_handler(signal.SIGQUIT, signal_handler.running_phase_sigquit_handler)
         else:
             logger.warning(
                 "Signal handler is not added because the tokenizer manager is "
                 "not in the main thread. This disables graceful shutdown of the "
                 "tokenizer manager when SIGTERM is received."
             )
-        self.asyncio_tasks.add(
-            loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
-        )
+        self.asyncio_tasks.add(loop.create_task(print_exception_wrapper(self.sigterm_watchdog)))
 
     def dump_requests_before_crash(self):
         if self.crash_dump_performed:
-            logger.info(
-                "SIGTERM/SIGQUIT/Exception triggered, but crash dump already performed, skipping."
-            )
+            logger.info("SIGTERM/SIGQUIT/Exception triggered, but crash dump already performed, skipping.")
             return
         logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
         self.crash_dump_performed = True
@@ -1273,9 +1221,7 @@ class TokenizerManager:
         unfinished_requests = []
         for rid, state in self.rid_to_state.items():
             if not state.finished:
-                unfinished_requests.append(
-                    (state.obj, {}, state.created_time, time.time())
-                )
+                unfinished_requests.append((state.obj, {}, state.created_time, time.time()))
         if unfinished_requests:
             data_to_dump.extend(unfinished_requests)
 
@@ -1285,7 +1231,7 @@ class TokenizerManager:
         filename = os.path.join(
             self.crash_dump_folder,
             os.getenv("HOSTNAME", None),
-            f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
+            f"crash_dump_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pkl",
         )
 
         os.makedirs(os.path.dirname(filename), exist_ok=True)
@@ -1325,9 +1271,7 @@ class TokenizerManager:
                 )
                 break
 
-            logger.info(
-                f"Gracefully exiting... remaining number of requests {remain_num_req}"
-            )
+            logger.info(f"Gracefully exiting... remaining number of requests {remain_num_req}")
             if remain_num_req > 0:
                 await asyncio.sleep(5)
             else:
@@ -1347,16 +1291,12 @@ class TokenizerManager:
 
     def _handle_batch_output(
         self,
-        recv_obj: Union[
-            BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
-        ],
+        recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut],
     ):
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
-                logger.error(
-                    f"Received output for {rid=} but the state was deleted in TokenizerManager."
-                )
+                logger.error(f"Received output for {rid=} but the state was deleted in TokenizerManager.")
                 continue
 
             # Build meta_info and return value
@@ -1372,8 +1312,7 @@ class TokenizerManager:
                     state,
                     state.obj.top_logprobs_num,
                     state.obj.token_ids_logprob,
-                    state.obj.return_text_in_logprobs
-                    and not self.server_args.skip_tokenizer_init,
+                    state.obj.return_text_in_logprobs and not self.server_args.skip_tokenizer_init,
                     recv_obj,
                     i,
                 )
@@ -1450,18 +1389,10 @@ class TokenizerManager:
             return
 
         if len(recv_obj.input_token_logprobs_val) > 0:
-            state.input_token_logprobs_val.extend(
-                recv_obj.input_token_logprobs_val[recv_obj_index]
-            )
-            state.input_token_logprobs_idx.extend(
-                recv_obj.input_token_logprobs_idx[recv_obj_index]
-            )
-        state.output_token_logprobs_val.extend(
-            recv_obj.output_token_logprobs_val[recv_obj_index]
-        )
-        state.output_token_logprobs_idx.extend(
-            recv_obj.output_token_logprobs_idx[recv_obj_index]
-        )
+            state.input_token_logprobs_val.extend(recv_obj.input_token_logprobs_val[recv_obj_index])
+            state.input_token_logprobs_idx.extend(recv_obj.input_token_logprobs_idx[recv_obj_index])
+        state.output_token_logprobs_val.extend(recv_obj.output_token_logprobs_val[recv_obj_index])
+        state.output_token_logprobs_idx.extend(recv_obj.output_token_logprobs_idx[recv_obj_index])
         meta_info["input_token_logprobs"] = self.detokenize_logprob_tokens(
             state.input_token_logprobs_val,
             state.input_token_logprobs_idx,
@@ -1475,18 +1406,10 @@ class TokenizerManager:
 
         if top_logprobs_num > 0:
             if len(recv_obj.input_top_logprobs_val) > 0:
-                state.input_top_logprobs_val.extend(
-                    recv_obj.input_top_logprobs_val[recv_obj_index]
-                )
-                state.input_top_logprobs_idx.extend(
-                    recv_obj.input_top_logprobs_idx[recv_obj_index]
-                )
-            state.output_top_logprobs_val.extend(
-                recv_obj.output_top_logprobs_val[recv_obj_index]
-            )
-            state.output_top_logprobs_idx.extend(
-                recv_obj.output_top_logprobs_idx[recv_obj_index]
-            )
+                state.input_top_logprobs_val.extend(recv_obj.input_top_logprobs_val[recv_obj_index])
+                state.input_top_logprobs_idx.extend(recv_obj.input_top_logprobs_idx[recv_obj_index])
+            state.output_top_logprobs_val.extend(recv_obj.output_top_logprobs_val[recv_obj_index])
+            state.output_top_logprobs_idx.extend(recv_obj.output_top_logprobs_idx[recv_obj_index])
             meta_info["input_top_logprobs"] = self.detokenize_top_logprobs_tokens(
                 state.input_top_logprobs_val,
                 state.input_top_logprobs_idx,
@@ -1500,29 +1423,19 @@ class TokenizerManager:
 
         if token_ids_logprob is not None:
             if len(recv_obj.input_token_ids_logprobs_val) > 0:
-                state.input_token_ids_logprobs_val.extend(
-                    recv_obj.input_token_ids_logprobs_val[recv_obj_index]
-                )
-                state.input_token_ids_logprobs_idx.extend(
-                    recv_obj.input_token_ids_logprobs_idx[recv_obj_index]
-                )
-            state.output_token_ids_logprobs_val.extend(
-                recv_obj.output_token_ids_logprobs_val[recv_obj_index]
-            )
-            state.output_token_ids_logprobs_idx.extend(
-                recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
-            )
+                state.input_token_ids_logprobs_val.extend(recv_obj.input_token_ids_logprobs_val[recv_obj_index])
+                state.input_token_ids_logprobs_idx.extend(recv_obj.input_token_ids_logprobs_idx[recv_obj_index])
+            state.output_token_ids_logprobs_val.extend(recv_obj.output_token_ids_logprobs_val[recv_obj_index])
+            state.output_token_ids_logprobs_idx.extend(recv_obj.output_token_ids_logprobs_idx[recv_obj_index])
             meta_info["input_token_ids_logprobs"] = self.detokenize_top_logprobs_tokens(
                 state.input_token_ids_logprobs_val,
                 state.input_token_ids_logprobs_idx,
                 return_text_in_logprobs,
             )
-            meta_info["output_token_ids_logprobs"] = (
-                self.detokenize_top_logprobs_tokens(
-                    state.output_token_ids_logprobs_val,
-                    state.output_token_ids_logprobs_idx,
-                    return_text_in_logprobs,
-                )
+            meta_info["output_token_ids_logprobs"] = self.detokenize_top_logprobs_tokens(
+                state.output_token_ids_logprobs_val,
+                state.output_token_ids_logprobs_idx,
+                return_text_in_logprobs,
             )
 
     def detokenize_logprob_tokens(
@@ -1532,10 +1445,7 @@ class TokenizerManager:
         decode_to_text: bool,
     ):
         if not decode_to_text:
-            return [
-                (logprob, token_id, None)
-                for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
-            ]
+            return [(logprob, token_id, None) for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)]
         else:
             assert self.tokenizer is not None
             token_texts = self.tokenizer.batch_decode(token_logprobs_idx)
@@ -1552,31 +1462,18 @@ class TokenizerManager:
         ret = []
         for i in range(len(token_logprobs_val)):
             if token_logprobs_val[i]:
-                ret.append(
-                    self.detokenize_logprob_tokens(
-                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
-                    )
-                )
+                ret.append(self.detokenize_logprob_tokens(token_logprobs_val[i], token_logprobs_idx[i], decode_to_text))
             else:
                 ret.append(None)
         return ret
 
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOut, i: int):
-        completion_tokens = (
-            recv_obj.completion_tokens[i]
-            if getattr(recv_obj, "completion_tokens", None)
-            else 0
-        )
+        completion_tokens = recv_obj.completion_tokens[i] if getattr(recv_obj, "completion_tokens", None) else 0
 
-        if (
-            state.first_token_time == 0.0
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
+        if state.first_token_time == 0.0 and self.disaggregation_mode != DisaggregationMode.PREFILL:
             state.first_token_time = state.last_time = time.time()
             state.last_completion_tokens = completion_tokens
-            self.metrics_collector.observe_time_to_first_token(
-                state.first_token_time - state.created_time
-            )
+            self.metrics_collector.observe_time_to_first_token(state.first_token_time - state.created_time)
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
             if num_new_tokens:
@@ -1605,9 +1502,7 @@ class TokenizerManager:
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
-        self.dump_request_list.append(
-            (state.obj, out_dict, state.created_time, time.time())
-        )
+        self.dump_request_list.append((state.obj, out_dict, state.created_time, time.time()))
 
         if len(self.dump_request_list) >= self.dump_requests_threshold:
             filename = os.path.join(
@@ -1634,14 +1529,9 @@ class TokenizerManager:
 
     def record_request_for_crash_dump(self, state: ReqState, out_dict: dict):
         current_time = time.time()
-        self.crash_dump_request_list.append(
-            (state.obj, out_dict, state.created_time, current_time)
-        )
+        self.crash_dump_request_list.append((state.obj, out_dict, state.created_time, current_time))
         # Remove requests older than 5 minutes based on finish time
-        while (
-            self.crash_dump_request_list
-            and current_time - self.crash_dump_request_list[0][3] >= 300
-        ):
+        while self.crash_dump_request_list and current_time - self.crash_dump_request_list[0][3] >= 300:
             self.crash_dump_request_list.popleft()
 
     def _handle_abort_req(self, recv_obj):
@@ -1664,9 +1554,7 @@ class TokenizerManager:
         state.event.set()
 
     def _handle_open_session_req_output(self, recv_obj):
-        self.session_futures[recv_obj.session_id].set_result(
-            recv_obj.session_id if recv_obj.success else None
-        )
+        self.session_futures[recv_obj.session_id].set_result(recv_obj.session_id if recv_obj.success else None)
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
         if self.server_args.dp_size == 1:
@@ -1696,14 +1584,11 @@ class TokenizerManager:
             vocab_size = self.tokenizer.vocab_size
             for token_id in label_token_ids:
                 if token_id >= vocab_size:
-                    raise ValueError(
-                        f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
-                    )
+                    raise ValueError(f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})")
 
         # Handle string or tokenized query/items
         if isinstance(query, str) and (
-            isinstance(items, str)
-            or (isinstance(items, list) and (not items or isinstance(items[0], str)))
+            isinstance(items, str) or (isinstance(items, list) and (not items or isinstance(items[0], str)))
         ):
             # Both query and items are text
             items_list = [items] if isinstance(items, str) else items
@@ -1718,12 +1603,7 @@ class TokenizerManager:
                 stream=False,
                 sampling_params={"max_new_tokens": 1},
             )
-        elif (
-            isinstance(query, list)
-            and isinstance(items, list)
-            and items
-            and isinstance(items[0], list)
-        ):
+        elif isinstance(query, list) and isinstance(items, list) and items and isinstance(items[0], list):
             # Both query and items are token IDs
             if item_first:
                 input_ids_list = [item + query for item in items]
@@ -1737,9 +1617,7 @@ class TokenizerManager:
                 sampling_params={"max_new_tokens": 1},
             )
         else:
-            raise ValueError(
-                "Invalid combination of query/items types for score_request."
-            )
+            raise ValueError("Invalid combination of query/items types for score_request.")
 
         results = await self.generate_request(batch_request, request).__anext__()
         scores = []
@@ -1747,25 +1625,19 @@ class TokenizerManager:
         for result in results:
             # Get logprobs for each token
             logprobs = {}
-            for logprob, token_id, _ in result["meta_info"].get(
-                "output_token_ids_logprobs", []
-            )[0]:
+            for logprob, token_id, _ in result["meta_info"].get("output_token_ids_logprobs", [])[0]:
                 if token_id in label_token_ids:
                     logprobs[token_id] = logprob
 
             # Get scores in order of label_token_ids
-            score_list = [
-                logprobs.get(token_id, float("-inf")) for token_id in label_token_ids
-            ]
+            score_list = [logprobs.get(token_id, float("-inf")) for token_id in label_token_ids]
 
             # Apply softmax to logprobs if needed
             if apply_softmax:
                 score_list = torch.softmax(torch.tensor(score_list), dim=0).tolist()
             else:
                 # Convert logprobs to probabilities if not using softmax
-                score_list = [
-                    math.exp(x) if x != float("-inf") else 0.0 for x in score_list
-                ]
+                score_list = [math.exp(x) if x != float("-inf") else 0.0 for x in score_list]
 
             scores.append(score_list)
 
@@ -1793,15 +1665,11 @@ class SignalHandler:
         self.tokenizer_manager = tokenizer_manager
 
     def sigterm_handler(self, signum=None, frame=None):
-        logger.warning(
-            f"SIGTERM received. {signum=} {frame=}. Draining requests and shutting down..."
-        )
+        logger.warning(f"SIGTERM received. {signum=} {frame=}. Draining requests and shutting down...")
         self.tokenizer_manager.gracefully_exit = True
 
     def running_phase_sigquit_handler(self, signum=None, frame=None):
-        logger.error(
-            "Received sigquit from a child process. It usually means the child failed."
-        )
+        logger.error("Received sigquit from a child process. It usually means the child failed.")
         self.tokenizer_manager.dump_requests_before_crash()
         kill_process_tree(os.getpid())
 
@@ -1844,6 +1712,36 @@ class _Communicator(Generic[T]):
     def handle_recv(self, recv_obj: T):
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
+            self._result_event.set()
+
+
+class _FlexibleCommunicator(Generic[T]):
+    def __init__(self, sender, fan_out: int):
+        self._sender = sender
+        self._fan_out = fan_out
+        self._partial_release_mode = False
+
+    async def __call__(self, obj, target_workers=None, wait_all=False):
+        if target_workers:
+            for worker_id in target_workers:
+                specific_obj = copy.copy(obj)
+                specific_obj.target_worker = worker_id
+                self._sender.send_pyobj(specific_obj)
+            expected_responses = len(target_workers)
+        else:
+            self._sender.send_pyobj(obj)
+            expected_responses = self._fan_out if wait_all else 1
+
+        self._result_event = asyncio.Event()
+        self._result_values = []
+        self._expected_responses = expected_responses
+        await self._result_event.wait()
+        # breakpoint()
+        return self._result_values[:expected_responses]
+
+    def handle_recv(self, recv_obj: T):
+        self._result_values.append(recv_obj)
+        if len(self._result_values) >= self._expected_responses:
             self._result_event.set()
 
 
