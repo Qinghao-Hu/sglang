@@ -94,6 +94,8 @@ class EAGLEWorker(TpModelWorker):
             server_args.speculative_algorithm
         )
         self.padded_static_len = -1
+        self.strategy_min_bs = None
+        self.strategy_max_bs = None
 
         # Override context length with target model's context length
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -162,12 +164,7 @@ class EAGLEWorker(TpModelWorker):
         self.draft_model_runner.server_args.disable_cuda_graph = (
             backup_disable_cuda_graph
         )
-        self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
-        )
-        with self.draft_tp_context(self.draft_model_runner.tp_group):
-            self.init_attention_backend()
-            self.init_cuda_graphs()
+        self.draft_tp_context = draft_tp_context if server_args.enable_dp_attention else empty_context
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -178,6 +175,10 @@ class EAGLEWorker(TpModelWorker):
         self.use_mab = bool(server_args.speculative_eagle_mab_configs)
         if server_args.speculative_eagle_mab_configs:
             self._init_mab_configurations()
+        else:
+            with self.draft_tp_context(self.draft_model_runner.tp_group):
+                self.init_attention_backend()
+                self.init_cuda_graphs()
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -342,7 +343,7 @@ class EAGLEWorker(TpModelWorker):
                 strategy = self.select_mab_strategy(batch_size)
                 self.mab_last_pull["batch_size"] = batch_size
                 self.mab_last_pull["mab_strategy"] = strategy
-                logger.info(f"Using MAB strategy {strategy} for batch size {batch_size}, selecting topk {self.topk}")
+                logger.info(f"Using MAB strategy {strategy} for batch size {batch_size}")
 
             batch.spec_info.topk_p = batch.spec_info.topk_p[:, : self.topk]
             batch.spec_info.topk_index = batch.spec_info.topk_index[:, : self.topk]
@@ -1044,19 +1045,14 @@ class EAGLEWorker(TpModelWorker):
         # Initialize resources for the default strategy
         self.mab_strategies = [self.default_mab_strategy]
         self.strategy_resources: Dict[str, SpeculativeResources] = {}
-        self.strategy_resources[self.default_mab_strategy] = SpeculativeResources(
-            draft_attn_backend=self.draft_attn_backend,
-            draft_cuda_graph_runner=self.cuda_graph_runner,
-            target_attn_backend=self.target_worker.model_runner.attn_backend,
-            target_cuda_graph_runner=self.target_worker.model_runner.cuda_graph_runner,
-        )
-
-        max_topk_needed = max(MABConfig.parse_config(strategy)[1] for strategy in self.mab_strategies)
-        self.max_topk = max(self.max_topk, max_topk_needed)
 
         # Parse additional MAB strategies if provided
         self.mab_strategies.extend(self.server_args.speculative_eagle_mab_configs)
         self.mab_strategies = sorted(list(set(self.mab_strategies)))
+
+        # Calculate max topk needed across all strategies
+        max_topk_needed = max(MABConfig.parse_config(strategy)[1] for strategy in self.mab_strategies)
+        self.max_topk = max(self.max_topk, max_topk_needed)
 
         # Set window size for MAB metrics
         self.mab_window_size = self.server_args.speculative_mab_window_size
@@ -1073,30 +1069,70 @@ class EAGLEWorker(TpModelWorker):
             "batch_size": None,
         }
 
-        # Set up resources for all strategies
+        # Group strategies by draft_tokens for target model CUDA graph sharing
+        draft_tokens_groups = {}
+        for strategy in self.mab_strategies:
+            _, _, draft_tokens = MABConfig.parse_config(strategy)
+            if draft_tokens not in draft_tokens_groups:
+                draft_tokens_groups[draft_tokens] = []
+            draft_tokens_groups[draft_tokens].append(strategy)
+
+        # Shared target model resources by draft_tokens
+        target_resources_by_draft_tokens = {}
+        for draft_tokens, strategies_group in draft_tokens_groups.items():
+            # Temporarily set parameters for target model initialization
+            original_draft_tokens = self.server_args.speculative_num_draft_tokens
+            self.server_args.speculative_num_draft_tokens = draft_tokens
+            self.target_worker.model_runner.server_args.speculative_num_draft_tokens = draft_tokens
+
+            # Get batch size range for this group (use the union of all strategies)
+            min_bs_list, max_bs_list = [], []
+            for strategy in strategies_group:
+                min_bs, max_bs = self.mab_manager.get_strategy_bs_range(strategy)
+                min_bs_list.append(min_bs)
+                max_bs_list.append(max_bs)
+            group_min_bs = min(min_bs_list)
+            group_max_bs = max(max_bs_list)
+
+            # Initialize target model resources
+            logger.info(f"Initializing target model cuda graph for draft_tokens {draft_tokens}")
+            self.target_worker.model_runner.init_attention_backend()
+            self.target_worker.model_runner.init_cuda_graphs(strategy_min_bs=group_min_bs, strategy_max_bs=group_max_bs)
+
+            # Store target resources for this draft_tokens group
+            target_resources_by_draft_tokens[draft_tokens] = {
+                "attn_backend": self.target_worker.model_runner.attn_backend,
+                "cuda_graph_runner": self.target_worker.model_runner.cuda_graph_runner,
+            }
+
+            # Restore original draft_tokens
+            self.server_args.speculative_num_draft_tokens = original_draft_tokens
+            self.target_worker.model_runner.server_args.speculative_num_draft_tokens = original_draft_tokens
+
+        # Set up resources for all strategies (draft model resources are strategy-specific)
         for mab_strategy in self.mab_strategies:
-            if mab_strategy == self.default_mab_strategy:
-                continue
+            logger.info(f"Initializing draft model resources for strategy {mab_strategy}")
+            _, _, draft_tokens = MABConfig.parse_config(mab_strategy)
 
-            logging.info(f"Initializing MAB strategy {mab_strategy} resources")
+            # Temporarily update parameters for draft model initialization
             self.update_speculative_args(mab_strategy)
-            # self.max_topk = max(self.max_topk, self.topk)
+            self.strategy_min_bs, self.strategy_max_bs = self.mab_manager.get_strategy_bs_range(mab_strategy)
 
-            # Initialize draft worker resources
+            logger.info(f"Initializing draft model cuda graph with strategy {mab_strategy} ")
+            # Initialize draft worker resources (these are strategy-specific)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.init_attention_backend()
                 self.init_cuda_graphs()
 
-            # Initialize target worker resources
-            self.target_worker.model_runner.init_attention_backend()
-            self.target_worker.model_runner.init_cuda_graphs()
+            # Get shared target resources for this strategy's draft_tokens
+            target_resources = target_resources_by_draft_tokens[draft_tokens]
 
-            # Store resources for the strategy
+            # Store resources for the strategy (draft-specific + shared target)
             self.strategy_resources[mab_strategy] = SpeculativeResources(
                 draft_attn_backend=self.draft_attn_backend,
                 draft_cuda_graph_runner=self.cuda_graph_runner,
-                target_attn_backend=self.target_worker.model_runner.attn_backend,
-                target_cuda_graph_runner=self.target_worker.model_runner.cuda_graph_runner,
+                target_attn_backend=target_resources["attn_backend"],
+                target_cuda_graph_runner=target_resources["cuda_graph_runner"],
             )
 
         self.set_mab_strategy(self.default_mab_strategy)

@@ -25,7 +25,6 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -1353,7 +1352,7 @@ class ModelRunner:
                 .cuda()
             )
 
-    def init_cuda_graphs(self):
+    def init_cuda_graphs(self, strategy_min_bs: Optional[int] = None, strategy_max_bs: Optional[int] = None):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
         self.cuda_graph_mem_usage = 0
@@ -1371,7 +1370,7 @@ class ModelRunner:
         logger.info(
             f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        self.cuda_graph_runner = CudaGraphRunner(self)
+        self.cuda_graph_runner = CudaGraphRunner(self, strategy_min_bs=strategy_min_bs, strategy_max_bs=strategy_max_bs)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.cuda_graph_mem_usage = before_mem - after_mem
 

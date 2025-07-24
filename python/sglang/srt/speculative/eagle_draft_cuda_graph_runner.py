@@ -4,7 +4,6 @@ import bisect
 from typing import TYPE_CHECKING, Callable
 
 import torch
-
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
@@ -59,7 +58,9 @@ class EAGLEDraftCudaGraphRunner:
         server_args = model_runner.server_args
 
         # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
+            model_runner, self.eagle_worker.strategy_min_bs, self.eagle_worker.strategy_max_bs
+        )
         self.num_tokens_per_bs = server_args.speculative_eagle_topk
 
         # Attention backend

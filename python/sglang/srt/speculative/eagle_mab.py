@@ -194,13 +194,108 @@ class UCB1MAB(BaseMAB):
         )
 
 
+class BucketedEpsilonGreedyMAB(BaseMAB):
+    """Hybrid strategy that combines PredefinedMapping and EpsilonGreedy.
+
+    Args:
+        bs_threshold: List of batch size thresholds for predefined mappings.
+        epsilon: Exploration rate for epsilon-greedy strategy.
+
+    This algorithm uses predefined mappings for specific batch size ranges
+    where we have strong priors about optimal configurations, while allowing
+    epsilon-greedy learning for other ranges where exploration is beneficial.
+    """
+
+    def __init__(self, strategies: List[str], bs_threshold: List[int] = [1, 2, 5, 21], epsilon: float = 0.1, **kwargs):
+        super().__init__(strategies, **kwargs)
+        self.epsilon = epsilon
+        self.bs_threshold = bs_threshold
+
+        # Group strategies by draft_tokens for better organization
+        self.draft_tokens_groups = self._group_by_draft_tokens()
+        self.num_bucket = len(self.draft_tokens_groups)
+        assert self.num_bucket == len(self.bs_threshold)
+
+        self._create_buckets()
+
+        logger.info("BucketedEpsilonGreedyMAB initialized:")
+        logger.info(f"  self.batch_strategy_mapping: {self.batch_strategy_mapping}")
+
+    def _group_by_draft_tokens(self) -> Dict[int, List[str]]:
+        """Group strategies by their draft_tokens value."""
+        groups = {}
+        for strategy in self.strategies:
+            _, _, draft_tokens = MABConfig.parse_config(strategy)
+            if draft_tokens not in groups:
+                groups[draft_tokens] = []
+            groups[draft_tokens].append(strategy)
+        return groups
+
+    def _create_buckets(self) -> List[Tuple[int, int, str]]:
+        """Create predefined batch size range mappings."""
+        self.bucket_list = list(self.draft_tokens_groups.keys())
+        self.bucket_list.sort(reverse=True)  # Sort by draft_tokens descending
+
+        # Create batch size ranges and allocate strategies
+        self.batch_bucket_mapping = []  # (min_batch, max_batch, draft_tokens)
+        self.batch_strategy_mapping = {}  # (min_batch, max_batch): list of strategies
+        for i in range(len(self.bs_threshold)):
+            min_batch = self.bs_threshold[i]
+            if i + 1 < len(self.bs_threshold):
+                max_batch = self.bs_threshold[i + 1] - 1
+            else:
+                max_batch = float("inf")
+            self.batch_bucket_mapping.append((min_batch, max_batch, self.bucket_list[i]))
+            self.batch_strategy_mapping[(min_batch, max_batch)] = self.draft_tokens_groups[self.bucket_list[i]]
+
+    def select_strategy(self, batch_size: int = None) -> str:
+        """Choose strategy using hybrid approach."""
+        if batch_size is None:
+            raise ValueError("BucketedEpsilonGreedyMAB requires batch_size parameter")
+
+        for min_batch, max_batch, draft_tokens in self.batch_bucket_mapping:
+            if min_batch <= batch_size <= max_batch:
+                valid_strategies = self.draft_tokens_groups[draft_tokens]
+                # If only one strategy in this bucket, use it directly
+                if len(valid_strategies) == 1:
+                    return valid_strategies[0]
+                # Otherwise, use epsilon-greedy among valid strategies
+                return self._epsilon_greedy_select(valid_strategies)
+        # Fallback: if no bucket matches, use epsilon-greedy among all strategies
+        return self._epsilon_greedy_select(self.strategies)
+
+    def _epsilon_greedy_select(self, valid_strategies: List[str]) -> str:
+        """Standard epsilon-greedy selection."""
+        # With probability epsilon, choose randomly
+        if np.random.random() < self.epsilon:
+            return np.random.choice(valid_strategies)
+
+        # Otherwise choose the best strategy based on median reward
+        strategy_scores = {}
+        for s in valid_strategies:
+            rewards = self.strategy_metrics[s].rewards
+            strategy_scores[s] = float(np.median(rewards)) if rewards else float("inf")
+
+        return max(strategy_scores, key=strategy_scores.get)
+
+    def get_strategy_bs_range(self, strategy: str) -> Tuple[Optional[int], Optional[int]]:
+        """Get batch size range for a given strategy."""
+        for min_batch, max_batch, draft_tokens in self.batch_bucket_mapping:
+            if strategy in self.draft_tokens_groups[draft_tokens]:
+                return min_batch, max_batch
+        return None, None
+
+
 class PredefinedMappingStrategy(BaseMAB):
     """Simple predefined strategy selector based on batch size ranges."""
 
-    def __init__(self, strategies: List[str], **kwargs):
+    def __init__(self, strategies: List[str], bs_threshold: List[int] = [1, 2, 5, 21], **kwargs):
         super().__init__(strategies, **kwargs)
+        self.bs_threshold = bs_threshold
 
-        assert len(strategies) == 4, "PredefinedMappingStrategy requires exactly 4 strategies."
+        assert len(strategies) == len(self.bs_threshold), (
+            "PredefinedMappingStrategy requires exactly same mapping number."
+        )
 
         # Parse and sort strategies by draft_tokens (descending)
         strategy_tokens_pairs = []
@@ -213,14 +308,16 @@ class PredefinedMappingStrategy(BaseMAB):
         self.sorted_tokens = [pair[1] for pair in strategy_tokens_pairs]
 
         # Create batch size ranges and allocate strategies
-        self.batch_ranges = [
-            (1, 1, self.sorted_strategies[0]),  # Batch size 1: largest verify tokens (best speedup)
-            (2, 4, self.sorted_strategies[1]),
-            (5, 20, self.sorted_strategies[2]),
-            (21, float("inf"), self.sorted_strategies[3]),
-        ]
+        self.batch_ranges = []
+        for i in range(len(self.bs_threshold)):
+            min_batch = self.bs_threshold[i]
+            if i + 1 < len(self.bs_threshold):
+                max_batch = self.bs_threshold[i + 1] - 1
+            else:
+                max_batch = float("inf")
+            self.batch_ranges.append((min_batch, max_batch, self.sorted_strategies[i]))
 
-        logger.info(f"FixedMappingStrategy initialized with sorted strategies (steps_topk_verifyTokens):")
+        logger.info("FixedMappingStrategy initialized with sorted strategies (steps_topk_verifyTokens):")
         for min_batch, max_batch, strategy in self.batch_ranges:
             tokens = MABConfig.parse_config(strategy)[2]
             range_str = (
@@ -232,9 +329,19 @@ class PredefinedMappingStrategy(BaseMAB):
 
     def select_strategy(self, batch_size: int = None) -> str:
         """Choose strategy based on batch size"""
+        if batch_size is None:
+            raise ValueError("PredefinedMappingStrategy requires batch_size parameter")
+
         for min_batch, max_batch, strategy in self.batch_ranges:
             if min_batch <= batch_size <= max_batch:
                 return strategy
+
+    def get_strategy_bs_range(self, strategy: str) -> Tuple[int, int]:
+        """Get batch size range for a given strategy."""
+        for min_batch, max_batch, s in self.batch_ranges:
+            if s == strategy:
+                return min_batch, max_batch
+        return None, None
 
 
 class MABGroupManager:
@@ -251,6 +358,7 @@ class MABGroupManager:
         "PREDEFINED": lambda strategies, window_size: PredefinedMappingStrategy(
             strategies=strategies, window_size=window_size
         ),
+        "BEG": lambda strategies, window_size: BucketedEpsilonGreedyMAB(strategies=strategies, window_size=window_size),
     }
 
     def __init__(
@@ -316,7 +424,7 @@ class MABGroupManager:
         ]
         # If all strategies would cause OOM, return the safest one - the one with the least tokens
         if not valid_strategies:
-            return [min(self.strategies, key=lambda s: get_draft_tokens(s))]
+            return [min(self.strategies, key=get_draft_tokens)]
 
         return valid_strategies
 
@@ -340,14 +448,21 @@ class MABGroupManager:
         # Get appropriate group for all algorithms
         group = self._get_group(batch_size)
 
-        if self.algorithm in ["PREDEFINED"]:
-            return self.mabs[group].select_strategy(batch_size)
+        if self.algorithm in ["PREDEFINED", "BEG"]:
+            return self.mabs[group].select_strategy(batch_size=batch_size)
         else:
             # Get valid strategies for other algorithms
             valid_strategies = self._get_valid_strategies(batch_size)
 
             # Select strategy using the MAB algorithm
             return self.mabs[group].select_strategy(valid_strategies)
+
+    def get_strategy_bs_range(self, strategy: str) -> Tuple[int, int]:
+        """Get batch size range for a given strategy."""
+        if self.algorithm in ["PREDEFINED", "BEG"]:
+            return self.mabs[1].get_strategy_bs_range(strategy)
+        else:
+            return None, None
 
     def record_strategy_metrics(
         self, batch_size: int, strategy: str, reward: float, accept_length: float

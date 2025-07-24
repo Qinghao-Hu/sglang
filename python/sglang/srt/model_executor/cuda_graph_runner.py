@@ -24,8 +24,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import tqdm
-from torch.profiler import ProfilerActivity, profile
-
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
@@ -51,6 +49,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from torch.profiler import ProfilerActivity, profile
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +134,9 @@ def set_torch_compile_config():
     monkey_patch_torch_compile()
 
 
-def get_batch_sizes_to_capture(model_runner: ModelRunner, is_spec=False):
+def get_batch_sizes_to_capture(
+    model_runner: ModelRunner, spec_min_bs: Optional[int] = None, spec_max_bs: Optional[int] = None
+):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
 
@@ -184,6 +185,15 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, is_spec=False):
         if server_args.enable_torch_compile
         else []
     )
+
+    # For adaptive speculative, save the memory footprint for different Eagle configurations.
+    if spec_min_bs is not None and spec_max_bs is not None:
+        capture_bs = [bs for bs in capture_bs if spec_min_bs <= bs <= spec_max_bs]
+        compile_bs = (
+            [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
+            if server_args.enable_torch_compile
+            else []
+        )
     return capture_bs, compile_bs
 
 
@@ -203,7 +213,13 @@ def set_global_graph_memory_pool(val):
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner, is_spec=False):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        is_spec: bool = False,
+        strategy_min_bs: Optional[int] = None,
+        strategy_max_bs: Optional[int] = None,
+    ):
         # Parse args
         self.model_runner = model_runner
         self.graphs = {}
@@ -228,7 +244,7 @@ class CudaGraphRunner:
         self.is_spec = is_spec
 
         # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner, is_spec)
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner, strategy_min_bs, strategy_max_bs)
         rank0_log(f"Capture cuda graph bs {self.capture_bs}")
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
